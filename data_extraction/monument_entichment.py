@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List
 from urllib.error import HTTPError, URLError
+from identify_settlement import DEFAULT_DATASET, city_is_missing, find_built_up_area, load_built_up_areas
 
 from enrichment_common import (
     GeoPoint,
@@ -40,6 +41,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", default="data_extraction/monuments.csv")
     parser.add_argument("--output", default="data_extraction/monuments_enriched.csv")
+    parser.add_argument(
+        "--city-only",
+        action="store_true",
+        help="Fill missing city values from the local built-up-area dataset, then exit without Overpass requests",
+    )
     parser.add_argument("--cluster-cell-m", type=float, default=300.0)
     parser.add_argument("--bbox-buffer-m", type=float, default=120.0)
     parser.add_argument("--overpass-endpoint", default="https://overpass-api.de/api/interpreter")
@@ -105,6 +111,10 @@ def main() -> int:
     for column in ("highway", "dist"):
         if column not in output_fields:
             output_fields.append(column)
+    if "city" not in output_fields:
+        output_fields.append("city")
+    if "road_status" not in output_fields:
+        output_fields.append("road_status")
 
     # Load prior progress so interrupted runs can resume without repeating completed clusters.
     existing_rows = read_existing_csv(output_path, key_column=id_column)
@@ -120,12 +130,16 @@ def main() -> int:
         row = dict(source_row)
         row.setdefault("highway", "")
         row.setdefault("dist", "")
+        row.setdefault("city", "")
+        row.setdefault("road_status", "")
 
         # Restore completed values from a previous output file when available.
         previous = existing_rows.get(feature_id)
         if previous:
             row["highway"] = previous.get("highway", "")
             row["dist"] = previous.get("dist", "")
+            row["city"] = previous.get("city", "")
+            row["road_status"] = previous.get("road_status", "")
 
         rows.append(row)
         row_by_id[feature_id] = row
@@ -135,6 +149,34 @@ def main() -> int:
                 kept_points.append(GeoPoint(feature_id=feature_id, lat=lat, lon=lon))
 
     logging.info("Eligible monuments with UK coordinates: %s / %s", len(kept_points), len(rows))
+
+    # Fill missing city values locally before deciding which road rows need work.
+    city_lookup_needed = any(
+        city_is_missing(row_by_id[point.feature_id].get("city"))
+        for point in kept_points
+    )
+    if city_lookup_needed:
+        built_up_areas = load_built_up_areas(DEFAULT_DATASET)
+        for point in kept_points:
+            row = row_by_id[point.feature_id]
+            if city_is_missing(row.get("city")):
+                try:
+                    row["city"] = find_built_up_area(
+                        point.lat,
+                        point.lon,
+                        built_up_areas,
+                        buffer_m=100.0,
+                    )["name"]
+                except ValueError as error:
+                    logging.warning(
+                        "Skipping city lookup for monument %s: %s",
+                        point.feature_id,
+                        error,
+                    )
+    if args.city_only:
+        write_csv(output_path, rows, output_fields)
+        logging.info("City-only enrichment complete. CSV written to %s", output_path)
+        return 0
     if not kept_points:
         write_csv(output_path, rows, output_fields)
         return 0
@@ -142,8 +184,8 @@ def main() -> int:
     # Cluster nearby monuments so each Overpass request covers many points.
     clusters = cluster_points(kept_points, max(1.0, args.cluster_cell_m), max(0.0, args.bbox_buffer_m))
     for cluster in clusters:
-        # A non-empty highway and distance mean this point was already enriched.
-        if cluster_is_complete(cluster, kept_points, row_by_id, {"highway": set(), "dist": set()}):
+        # A distance value or explicit no-road status marks road distance enrichment as complete.
+        if cluster_is_complete(cluster, kept_points, row_by_id, {"dist": set(), "road_status": {"not_found"}}):
             continue
         south, west, north, east = cluster.bbox
         query = build_overpass_bbox_query(south, west, north, east, args.timeout_s)
@@ -159,8 +201,21 @@ def main() -> int:
             point = kept_points[point_index]
             road = nearest_road_for_point(point.lat, point.lon, payload)
             row = row_by_id[point.feature_id]
-            row["highway"] = road.highway or ""
-            row["dist"] = road.distance_m if road.distance_m is not None else ""
+
+            # Preserve the prior road classification when this row only needs its distance.
+            if not city_is_missing(row.get("dist")):
+                continue
+            highway_was_populated = not city_is_missing(row.get("highway"))
+            if road.distance_m is None:
+                row["dist"] = ""
+                row["road_status"] = "not_found"
+                if not highway_was_populated:
+                    row["highway"] = ""
+            else:
+                row["dist"] = road.distance_m
+                row["road_status"] = "found"
+                if not highway_was_populated:
+                    row["highway"] = road.highway or ""
 
         # Flush after every cluster to make long UK-wide runs restartable.
         write_csv(output_path, rows, output_fields)

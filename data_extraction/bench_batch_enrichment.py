@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
 from urllib.error import HTTPError, URLError
+from identify_settlement import DEFAULT_DATASET, city_is_missing, find_built_up_area, load_built_up_areas
 
 from enrichment_common import (
     GeoPoint,
@@ -65,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         "--output",
         default="data_extraction/bench_road_enrichment.csv",
         help="Path to output CSV file",
+    )
+    parser.add_argument(
+        "--city-only",
+        action="store_true",
+        help="Fill missing city values from the local built-up-area dataset, then exit without Overpass requests",
     )
 
     parser.add_argument(
@@ -302,6 +308,7 @@ def bench_fieldnames() -> list[str]:
         "osm_id",
         "settlement_name",
         "settlement_type",
+        "city",
         "road_status",
         "settlement_status",
     ]
@@ -358,6 +365,7 @@ def main() -> int:
             "osm_id": None,
             "settlement_name": None,
             "settlement_type": None,
+            "city": None,
             "road_status": None,
             "settlement_status": None,
         }
@@ -371,6 +379,7 @@ def main() -> int:
             row["osm_id"] = existing_row.get("osm_id") or None
             row["settlement_name"] = existing_row.get("settlement_name") or None
             row["settlement_type"] = existing_row.get("settlement_type") or None
+            row["city"] = existing_row.get("city") or None
             row["road_status"] = existing_row.get("road_status") or None
             row["settlement_status"] = existing_row.get("settlement_status") or None
 
@@ -381,6 +390,35 @@ def main() -> int:
             kept_points.append(point)
 
     logging.info("Points inside UK: %s / %s", len(kept_points), len(all_points))
+
+    # Fill missing city values from the local built-up polygons before road resumption checks.
+    city_lookup_needed = any(
+        city_is_missing(row_by_feature_id[point.feature_id].get("city"))
+        for point in kept_points
+    )
+    if city_lookup_needed:
+        built_up_areas = load_built_up_areas(DEFAULT_DATASET)
+        for point in kept_points:
+            row = row_by_feature_id[point.feature_id]
+            if city_is_missing(row.get("city")):
+                try:
+                    row["city"] = find_built_up_area(
+                        point.lat,
+                        point.lon,
+                        built_up_areas,
+                        buffer_m=100.0,
+                    )["name"]
+                except ValueError as err:
+                    logging.warning(
+                        "Skipping city lookup for bench feature %s: %s",
+                        point.feature_id,
+                        err,
+                    )
+
+    if args.city_only:
+        write_csv(output_path, rows, bench_fieldnames())
+        logging.info("City-only enrichment complete. CSV written to %s", output_path)
+        return 0
 
     if not kept_points:
         logging.warning("No UK points found. Writing output with empty enrichment fields.")
@@ -395,10 +433,8 @@ def main() -> int:
     )
     logging.info("Built %s clusters from UK points", len(clusters))
 
-    required_values = {
-        "road_status": {"found", "not_found"},
-        "settlement_status": {"found", "not_found"},
-    }
+    # A distance value or explicit no-road status marks road distance enrichment as complete.
+    required_values = {"distance_m": set(), "road_status": {"not_found"}}
 
     for c_idx, cluster in enumerate(clusters, start=1):
         if cluster_is_complete(cluster, kept_points, row_by_feature_id, required_values):
@@ -431,12 +467,10 @@ def main() -> int:
             timeout_s=args.timeout_s,
         )
 
-        settlement_query = build_overpass_settlement_query(
-            south=south,
-            west=west,
-            north=north,
-            east=east,
-            timeout_s=args.timeout_s,
+        # Skip settlement requests when existing rows only need distance backfill.
+        needs_full_rows = any(
+            row_by_feature_id[kept_points[point_index].feature_id].get("road_status") not in {"found", "not_found"}
+            for point_index in cluster.point_indices
         )
 
         try:
@@ -448,7 +482,8 @@ def main() -> int:
                 retry_wait_s=max(1, int(args.retry_wait_s)),
             )
         except HTTPError as err:
-            if err.code in {429, 504}:
+            # Keep the batch running when Overpass remains temporarily unavailable after retries.
+            if err.code in {429, 500, 502, 503, 504}:
                 logging.warning(
                     "Skipping cluster id=%s due to Overpass HTTP %s after retries.",
                     cluster.cluster_id,
@@ -476,52 +511,46 @@ def main() -> int:
             )
             continue
 
-        try:
-            settlement_payload = fetch_overpass_json(
-                query=settlement_query,
-                endpoint=args.overpass_endpoint,
+        settlement_polygons, settlement_centers = [], []
+        if needs_full_rows:
+            settlement_query = build_overpass_settlement_query(
+                south=south,
+                west=west,
+                north=north,
+                east=east,
                 timeout_s=args.timeout_s,
-                max_retries=max(0, int(args.max_retries)),
-                retry_wait_s=max(1, int(args.retry_wait_s)),
             )
-        except HTTPError as err:
-            if err.code in {429, 504}:
-                logging.warning(
-                    "Skipping cluster id=%s due to settlement HTTP %s after retries.",
-                    cluster.cluster_id,
-                    err.code,
+            try:
+                settlement_payload = fetch_overpass_json(
+                    query=settlement_query,
+                    endpoint=args.overpass_endpoint,
+                    timeout_s=args.timeout_s,
+                    max_retries=max(0, int(args.max_retries)),
+                    retry_wait_s=max(1, int(args.retry_wait_s)),
                 )
+                settlement_polygons, settlement_centers = extract_settlement_candidates(settlement_payload)
+            except (HTTPError, URLError, TimeoutError) as err:
+                logging.warning("Settlement lookup failed for cluster %s: %s", cluster.cluster_id, err)
                 write_csv(output_path, rows, bench_fieldnames())
-                logging.info(
-                    "Flushed progress to %s after skipping cluster %s",
-                    output_path,
-                    cluster.cluster_id,
-                )
                 continue
-            raise
-        except (URLError, TimeoutError) as err:
-            logging.warning(
-                "Skipping cluster id=%s due to settlement network timeout/error: %s",
-                cluster.cluster_id,
-                err,
-            )
-            write_csv(output_path, rows, bench_fieldnames())
-            logging.info(
-                "Flushed progress to %s after skipping cluster %s",
-                output_path,
-                cluster.cluster_id,
-            )
-            continue
-
-        settlement_polygons, settlement_centers = extract_settlement_candidates(settlement_payload)
 
         for kept_idx in cluster.point_indices:
             point = kept_points[kept_idx]
             road = nearest_road_for_point(point.lat, point.lon, payload)
 
             row = row_by_feature_id[point.feature_id]
+            previous_status = row.get("road_status")
+            if previous_status == "not_found" or not city_is_missing(row.get("distance_m")):
+                continue
+            row_was_populated = previous_status == "found"
             row["cluster_id"] = cluster.cluster_id
             row["distance_m"] = road.distance_m
+            row["road_status"] = "found" if road.distance_m is not None else "not_found"
+
+            # Existing road rows receive only the missing distance, preserving other columns.
+            if row_was_populated:
+                continue
+
             row["highway"] = road.highway
             row["name"] = road.name
             row["osm_id"] = road.osm_id
@@ -536,7 +565,6 @@ def main() -> int:
 
             row["settlement_name"] = settlement.settlement_name
             row["settlement_type"] = settlement.settlement_type
-            row["road_status"] = "found" if road.distance_m is not None else "not_found"
             row["settlement_status"] = (
                 "found" if settlement.settlement_name and settlement.settlement_type else "not_found"
             )

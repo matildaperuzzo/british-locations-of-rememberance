@@ -1,0 +1,24 @@
+highway,Additional Category Lookup
+bridleway,Rural
+busway,Urban Road
+construction,Special Road
+corridor,Special Road
+cycleway,Small path
+footway,Small path
+living_street,Special Road
+motorway,Urban Road
+motorway_link,Urban Road
+no,Special Road
+path,Small path
+pedestrian,Small Road
+primary,Urban Road
+raceway,Special Road
+residential,Small Road
+secondary,Urban Road
+secondary_link,Urban Road
+service,No Path
+steps,Special Road
+tertiary,Small Road
+track,Small path
+trunk,Urban Road
+unclassified,Small Road

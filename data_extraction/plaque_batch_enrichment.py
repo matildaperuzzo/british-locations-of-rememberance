@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Dict, List
 from urllib.error import HTTPError, URLError
 import numpy as np
+from identify_settlement import DEFAULT_DATASET, find_built_up_area, load_built_up_areas
 
 from enrichment_common import (
     GeoPoint,
     build_overpass_bbox_query,
-    cluster_is_complete,
     cluster_points,
     fetch_overpass_json,
     is_in_uk,
@@ -72,6 +72,15 @@ def parse_args() -> argparse.Namespace:
         "--lon-column",
         default="longitude",
         help="Input CSV longitude column",
+    )
+    parser.add_argument(
+        "--rerun",
+        choices=("distance", "city", "all"),
+        default="all",
+        help=(
+            "Fields to fill when missing: distance (distance_m and highway), "
+            "city, or all. Existing populated values are preserved."
+        ),
     )
 
     parser.add_argument(
@@ -148,6 +157,12 @@ def parse_float(value: str | None) -> float | None:
         return None
 
 
+def value_is_missing(value: object) -> bool:
+    """Treat blank cells and serialized null values as missing."""
+
+    return value is None or str(value).strip().lower() in {"", "nan", "none", "null"}
+
+
 def main() -> int:
     """Program entrypoint."""
 
@@ -194,6 +209,12 @@ def main() -> int:
     output_fieldnames = list(input_fieldnames)
     if "highway" not in output_fieldnames:
         output_fieldnames.append("highway")
+    if "distance_m" not in output_fieldnames:
+        output_fieldnames.append("distance_m")
+    if "city" not in output_fieldnames:
+        output_fieldnames.append("city")
+    if "road_status" not in output_fieldnames:
+        output_fieldnames.append("road_status")
 
     existing_rows = read_existing_csv(output_path, key_column=id_column)
     if existing_rows:
@@ -210,10 +231,16 @@ def main() -> int:
 
         row = dict(source_row)
         row.setdefault("highway", np.nan)
+        row.setdefault("distance_m", np.nan)
+        row.setdefault("city", np.nan)
+        row.setdefault("road_status", "")
 
         existing_row = existing_rows.get(row_id)
-        if existing_row is not None and existing_row.get("highway") is not None:
+        if existing_row is not None:
             row["highway"] = existing_row.get("highway", np.nan)
+            row["distance_m"] = existing_row.get("distance_m", np.nan)
+            row["city"] = existing_row.get("city", np.nan)
+            row["road_status"] = existing_row.get("road_status", "")
 
         has_coordinates = lat_value is not None and lon_value is not None
         in_uk = False
@@ -236,6 +263,22 @@ def main() -> int:
 
     logging.info("Eligible plaques with UK coordinates: %s / %s", len(kept_points), len(rows))
 
+    # Fill only missing city values locally before deciding which road rows need work.
+    city_lookup_needed = args.rerun in {"city", "all"} and any(
+        value_is_missing(row_by_feature_id[point.feature_id].get("city")) for point in kept_points
+    )
+    if city_lookup_needed:
+        built_up_areas = load_built_up_areas(DEFAULT_DATASET)
+        for point in kept_points:
+            row = row_by_feature_id[point.feature_id]
+            if value_is_missing(row.get("city")):
+                row["city"] = find_built_up_area(point.lat, point.lon, built_up_areas, buffer_m=100.0)["name"]
+
+    if args.rerun == "city":
+        write_csv(output_path, rows, output_fieldnames)
+        logging.info("City rerun complete. CSV written to %s", output_path)
+        return 0
+
     if not kept_points:
         write_csv(output_path, rows, output_fieldnames)
         logging.info("No processable points found. CSV written to %s", output_path)
@@ -248,10 +291,19 @@ def main() -> int:
     )
     logging.info("Built %s clusters from valid plaque points", len(clusters))
 
-    required_values = {"highway": set()}
-
     for c_idx, cluster in enumerate(clusters, start=1):
-        if cluster_is_complete(cluster, kept_points, row_by_feature_id, required_values):
+        pending_points = [
+            kept_points[kept_idx]
+            for kept_idx in cluster.point_indices
+            if (
+                value_is_missing(row_by_feature_id[kept_points[kept_idx].feature_id].get("distance_m"))
+                or (
+                    args.rerun == "all"
+                    and value_is_missing(row_by_feature_id[kept_points[kept_idx].feature_id].get("highway"))
+                )
+            )
+        ]
+        if not pending_points:
             logging.info(
                 "Skipping cluster %s/%s (id=%s) because all rows already exist in CSV",
                 c_idx,
@@ -290,7 +342,8 @@ def main() -> int:
                 retry_wait_s=max(1, int(args.retry_wait_s)),
             )
         except HTTPError as err:
-            if err.code in {429, 504}:
+            # Keep the batch running when Overpass remains temporarily unavailable after retries.
+            if err.code in {429, 500, 502, 503, 504}:
                 logging.warning(
                     "Skipping cluster id=%s due to Overpass HTTP %s after retries.",
                     cluster.cluster_id,
@@ -323,10 +376,23 @@ def main() -> int:
             road = nearest_road_for_point(point.lat, point.lon, payload)
             row = row_by_feature_id[point.feature_id]
 
+            distance_missing = value_is_missing(row.get("distance_m"))
+            highway_missing = value_is_missing(row.get("highway"))
+            if not distance_missing and not (args.rerun == "all" and highway_missing):
+                continue
+
             if road.distance_m is None:
-                row["highway"] = np.nan
+                if distance_missing:
+                    row["distance_m"] = np.nan
+                    row["road_status"] = "not_found"
+                if highway_missing:
+                    row["highway"] = np.nan
             else:
-                row["highway"] = road.highway
+                if distance_missing:
+                    row["distance_m"] = road.distance_m
+                    row["road_status"] = "found"
+                if highway_missing:
+                    row["highway"] = road.highway
 
         write_csv(output_path, rows, output_fieldnames)
         logging.info("Flushed progress to %s after cluster %s", output_path, cluster.cluster_id)
